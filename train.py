@@ -1,41 +1,38 @@
 """
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+This training script can be run on a single gpu mode).
 
 To run on a single GPU, example:
 $ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
 import os
 import time
 import math
 import pickle
-from contextlib import nullcontext
 
+import numpy
 import numpy as np
-# import torch
-# from torch.nn.parallel import DistributedDataParallel as DDP
-# from torch.distributed import init_process_group, destroy_process_group
+try:
+    import cupy
+    if cupy.cuda.is_available():
+        print("CUDA available, run train on gpu...")
+        np = cupy
+    else:
+        print("CUDA is NOT available, run train on cpu...")
+except:
+    print("CUDA is NOT available, run train on cpu...")
+    pass
 
 from model import GPTConfig, GPT
-
+#from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 500
 log_interval = 1
-eval_iters = 200
+eval_iters = 0 #200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -45,19 +42,19 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'shakespeare'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 6 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 512
+gradient_accumulation_steps = 1 #5 * 4 # used to simulate larger batch sizes
+batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 256 # 1024
 # model
-n_layer = 6
+n_layer = 1
 n_head = 12
-n_embd = 768
+n_embd = 768 #// 2
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = True # do we use bias inside LayerNorm and Linear layers?
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 3 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -100,9 +97,9 @@ def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
-        data = np.asarray(np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')) # Cast to cupy or numpy depends on gpu
+        data = np.asarray(numpy.memmap(os.path.join(data_dir, 'train.bin'), dtype=numpy.uint16, mode='r')) # Cast to cupy or numpy depends on gpu
     else:
-        data = np.asarray(np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')) # Cast to cupy or numpy depends on gpu
+        data = np.asarray(numpy.memmap(os.path.join(data_dir, 'val.bin'), dtype=numpy.uint16, mode='r')) # Cast to cupy or numpy depends on gpu
 
     ix = np.random.randint(len(data) - block_size, size=(batch_size,))
     x = np.stack([(data[i:i+block_size]).astype(np.int64) for i in ix])
@@ -195,7 +192,6 @@ def estimate_loss():
             logits, loss = model.forward(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
-    model.train()
     return out
 
 # learning rate decay scheduler (cosine with warmup)
@@ -218,6 +214,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
+total_time = time.time()
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
@@ -259,8 +256,7 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        logits, loss = model.forward(X, Y)
-        loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        logits, loss = model.forward(X, Y, gradient_accumulation_steps)
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -270,11 +266,9 @@ while True:
     #     scaler.unscale_(optimizer)
     #     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
-    #scaler.step(optimizer)
     optimizer.step()
-    #scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad()
 
     # timing and logging
     t1 = time.time()
@@ -290,7 +284,7 @@ while True:
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
-
     # termination conditions
     if iter_num > max_iters:
         break
+print(f"Total training time: {time.time() - total_time}")

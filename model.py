@@ -13,17 +13,18 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 from dataclasses import dataclass
+import time
 
 import numpy as np
 try:
     import cupy
     if cupy.cuda.is_available():
-        print("CUDA available, run on gpu...")
+        print("CUDA available, run model on gpu...")
         np = cupy
     else:
-        print("CUDA is NOT available, run on cpu...")
+        print("CUDA is NOT available, run model on cpu...")
 except:
-    print("CUDA is NOT available, run on cpu...")
+    print("CUDA is NOT available, run model on cpu...")
     pass
 
 class LayerNorm:
@@ -33,32 +34,30 @@ class LayerNorm:
         super().__init__()
         self.weight = np.ones(ndim)
         self.bias = np.zeros(ndim) if bias else None
-        self.weight_g = None
-        self.bias_g = None
+        self.weight_g = np.zeros_like(self.weight)
+        self.bias_g = np.zeros_like(self.bias)
 
         self.eps = eps
 
         self.mean = None
         self.var = None
-        self.saved_var_inv = None
+        self.sqrt_var = None
         self.saved_normalized = None
         self.scaled_x = None
 
-    def forward(self, x):
+    def forward(self, x: np.ndarray) -> np.ndarray:
         self.mean = x.mean(-1, keepdims=True) # (B, T, 1)
         self.var = x.var(-1, ddof=0, keepdims=True) # (B, T, 1)
-        var_inv = (self.var + self.eps) ** -0.5 # (B, T, 1)
+        self.sqrt_var = np.sqrt(self.var + self.eps) # (B, T, 1)
         self.scaled_x = (x - self.mean)
-        normalized = self.scaled_x * var_inv  #(B, T, C)
+        normalized = self.scaled_x / self.sqrt_var  #(B, T, C)
 
-        self.saved_var_inv = var_inv
         self.saved_normalized = normalized
 
         out = self.weight * self.saved_normalized + self.bias # (ndim) * (B, T, C) + (ndim) = (B, T, C)
-
         return out
 
-    def backward(self, grad) -> np.ndarray:
+    def backward(self, grad: np.ndarray) -> np.ndarray:
         """
         Normalized matrix is already saved in saved_normalized and
         inverse of variance is already saved in saved_var_inv.
@@ -67,29 +66,31 @@ class LayerNorm:
         """
         n = grad.shape[-1]
 
-        self.weight_g = np.sum(grad * self.saved_normalized, axis=(0, 1))
-        self.bias_g = np.sum(grad, axis=(0, 1))
+        self.weight_g += np.sum(grad * self.saved_normalized, axis=(0, 1))
+        self.bias_g += np.sum(grad, axis=(0, 1))
 
         a = grad * self.weight
-        b = - np.sum(grad * self.weight, axis=-1, keepdims=True) * 1 / n
-        c = self.saved_var_inv ** 2 * (-1) * np.sum(self.scaled_x * grad * self.weight, axis=-1, keepdims=True) * self.scaled_x / n
+        b = np.sum(a, axis=-1, keepdims=True) / n
+        c = self.saved_normalized * np.sum(self.saved_normalized * a, axis=-1, keepdims=True) / n
 
-        grad_out = self.saved_var_inv * (a + b + c)
+        grad_out = (a - b - c) / self.sqrt_var
 
         return grad_out
+
 
 class Softmax:
     def __init__(self, axis):
         self.axis = axis
         self.probs = None
 
-    def forward(self, x):
+    def forward(self, x: np.ndarray) -> np.ndarray:
         exp_x = np.exp(x - np.expand_dims(np.max(x, axis=self.axis), axis=self.axis))
         self.probs = exp_x/np.sum(exp_x, axis=self.axis, keepdims=True)
         return self.probs
 
-    def backward(self, grad):
-        return (self.probs * (grad - (grad * self.probs).sum(axis=self.axis, keepdims=True, dtype=np.float32))).astype(grad.dtype)
+    def backward(self, grad: np.ndarray) -> np.ndarray:
+        out = (self.probs * (grad - (grad * self.probs).sum(axis=self.axis, keepdims=True, dtype=np.float32))).astype(grad.dtype)
+        return out
 
 
 class Linear:
@@ -97,34 +98,36 @@ class Linear:
         self.W = np.random.normal(0.0, 1.0, (out_features, in_features)).astype(dtype=dtype)
         self.b = np.zeros(out_features, dtype=dtype)
 
-        self.Wg = None
-        self.bg = None
+        self.Wg = np.zeros_like(self.W)
+        self.bg = np.zeros_like(self.b)
         self.saved_x = None
 
-    def forward(self, x):
+    def forward(self, x: np.ndarray) -> np.ndarray:
         self.saved_x = x.copy()
-        #TODO: Check for transpose
-        return np.matmul(self.saved_x, self.W.T) + self.b
+        out = np.matmul(self.saved_x, self.W.T) + self.b
+        return out
 
-    def backward(self, grad):
-        #TODO: Check for equality
+    def backward(self, grad: np.ndarray) -> np.ndarray:
         dh = np.matmul(grad, self.W)
-        self.Wg = np.matmul(np.moveaxis(grad, -1, -2), self.saved_x).sum(0)
-        self.bg = grad.sum(-2).sum(-2)
+        self.Wg += np.matmul(np.moveaxis(grad, -1, -2), self.saved_x).sum(0)
+        self.bg += grad.sum((0, 1))
         return dh
+
 
 class Dropout:
     def __init__(self, rate):
         assert 0 <= rate <= 1
         self.rate = rate
-        self.__saved_mask = None
+        self.saved_out = None
 
-    def forward(self, x):
-        self.__saved_mask = (np.random.rand(*x.shape) > self.rate)
-        return self.__saved_mask * x / (1.0 - self.rate)
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        mask = (np.random.rand(*x.shape) > self.rate)
+        self.saved_out = mask * x / (1.0 - self.rate)
+        return self.saved_out
 
-    def backward(self, grad):
-        return self.__saved_mask / (1.0 - self.rate) * grad
+    def backward(self, grad: np.ndarray) -> np.ndarray:
+        out = self.saved_out * grad
+        return out
 
 
 class Embedding:
@@ -132,40 +135,40 @@ class Embedding:
         self.vocab_size = vocab_size
         self.embedding_size = embedding_size
         self.weight = np.random.normal(0.0, 1.0, (vocab_size, embedding_size)).astype(dtype=dtype)
-        self.weight_g = None
+        self.weight_g = np.zeros_like(self.weight)
         self.saved_idx = None
 
     def forward(self, idx):
         self.saved_idx = idx.copy()
-        return self.weight[self.saved_idx]
+        out = self.weight[self.saved_idx] # replace to take
+        return out
 
     def backward(self, grad):
         dweight = np.zeros_like(self.weight)
         dweight[self.saved_idx] += np.sum(grad, 0)
-        self.weight_g = dweight.copy()
+        self.weight_g += dweight
         return grad
+
 
 class Gelu:
     r"""
     GELU (Gaussian Error Linear Units) module. Used formula:
     .. math::
        GELU(x) = 0.5 * x * (1 + Tanh(\sqrt{\frac{2}{\pi}} * (x + 0.044715 * x^3) ))
-    :param x:
-    :return:
     """
     def __init__(self):
         self.c = 0.044715
-
         self.saved_in_x = None
         self.t = None
 
     def forward(self, x) -> np.ndarray:
         self.saved_in_x = x.copy()
         self.t = np.tanh(np.sqrt(2 / np.pi) * (x + self.c * x**3))
-        return 0.5 * x * (1 + self.t)
+        out = 0.5 * x * (1 + self.t)
+        return out
 
     def backward(self, grad) -> np.ndarray:
-        out = 0.5 * ((1 + self.t) + (1 - self.t**2) * np.sqrt(2 / np.pi) * (1 + 3 * self.c ** 2))
+        out = 0.5 * (1 + self.t) + (1 - self.t**2) * self.saved_in_x * (1 + 3 * self.c * self.saved_in_x ** 2) / math.sqrt(2 * math.pi)
         return out * grad
 
 
@@ -178,30 +181,23 @@ class MLP:
         self.c_proj  = Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = Dropout(config.dropout)
 
-        self.saved_c_fc_out = None
-        self.saved_gelu_out = None
-        self.saved_c_proj_out = None
-        self.saved_dropout_out = None
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        x = self.c_fc.forward(x)
+        x = self.gelu.forward(x)
+        x = self.c_proj.forward(x)
+        x = self.dropout.forward(x)
+        return x
 
-    def forward(self, x):
-        self.saved_c_fc_out = self.c_fc.forward(x)
-        self.saved_gelu_out = self.gelu.forward(self.saved_c_fc_out)
-        self.saved_c_proj_out = self.c_proj.forward(self.saved_gelu_out)
-        self.saved_dropout_out = self.dropout.forward(self.saved_c_proj_out)
-        return self.saved_dropout_out
+    def backward(self, grad: np.ndarray) -> np.ndarray:
+        grad = self.dropout.backward(grad)
+        grad = self.c_proj.backward(grad)
+        grad = self.gelu.backward(grad)
+        grad = self.c_fc.backward(grad)
+        return grad
 
-    def backward(self, grad):
-        dropout_g = self.dropout.backward(grad)
-        proj_g = self.c_proj.backward(dropout_g)
-        gelu_g = self.gelu.backward(proj_g)
-        c_fc_g = self.c_fc.backward(gelu_g)
-        return c_fc_g
 
 class CausalSelfAttention:
-
     def __init__(self, config):
-        super().__init__()
-
         # key, query, value projections for all heads, but in a batch
         self.c_attn = Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -224,7 +220,7 @@ class CausalSelfAttention:
         self.q_t = None
         self.v_t = None
 
-    def forward(self, x):
+    def forward(self, x: np.ndarray) -> np.ndarray:
         """
         Forward pass for CausalSelfAttention
         :param x:
@@ -243,7 +239,7 @@ class CausalSelfAttention:
         # manual implementation of attention
         att = np.matmul(self.q_t,  np.transpose(self.k_t, (0, 1, 3, 2))) * (1.0 / math.sqrt(self.k_t.shape[-1]))
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        att[np.tril(np.ones_like(att))[:, :, :self.T, :self.T] == 0] = float('-inf')
+        att = np.where(np.tril(np.ones_like(att))[:, :, :self.T, :self.T] != 0, att, float('-inf'))
         att = self.softmax.forward(att)
         self.att = self.attn_dropout.forward(att)
 
@@ -251,10 +247,9 @@ class CausalSelfAttention:
         y = np.ascontiguousarray(np.transpose(y, (0, 2, 1, 3))).reshape(self.B, self.T, self.C) # re-assemble all head outputs side by side
         # output projection
         y = self.resid_dropout.forward(self.c_proj.forward(y))
-
         return y
 
-    def backward(self, grad):
+    def backward(self, grad: np.ndarray) -> np.ndarray:
         """
         Backward pass for CausalSelfAttention
         :param grad:
@@ -266,13 +261,12 @@ class CausalSelfAttention:
         y_g = resid_dropout_g.reshape(self.B, self.T, self.n_head, self.C // self.n_head)
         y_g = np.transpose(y_g, (0, 2, 1, 3))
 
-        v_g = np.matmul(self.att, y_g)  # QK^T @ y_g -> v_g: (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        v_g = np.matmul(np.transpose(self.att, (0, 1, 3, 2)), y_g)  # QK^T @ y_g -> v_g: (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         att_g = np.matmul(y_g, np.transpose(self.v_t, (0, 1, 3, 2))) # y_g @ v -> v_g: (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
         att_dropout_g = self.attn_dropout.backward(att_g)
         att_softmax_g = self.softmax.backward(att_dropout_g)
-
-        att_softmax_g[np.tril(np.ones_like(att_softmax_g))[:, :, :self.T, :self.T] == 0] = 0
+        att_softmax_g = np.where(np.tril(np.ones_like(att_softmax_g))[:, :, :self.T, :self.T] != 0, att_softmax_g, 0)
 
         q_t_g = (1.0 / math.sqrt(self.k_t.shape[-1])) * (np.matmul(att_softmax_g, self.k_t))
         k_t_g = (1.0 / math.sqrt(self.k_t.shape[-1])) * (np.matmul(np.transpose(att_softmax_g, (0, 1, 3, 2)), self.q_t)) # (Q^T @ att)^T = att^T @ Q
@@ -295,12 +289,12 @@ class Block:
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x: np.ndarray) -> np.ndarray:
         x = x + self.attn.forward(self.ln_1.forward(x))
         x = x + self.mlp.forward(self.ln_2.forward(x))
         return x
 
-    def backward(self, grad):
+    def backward(self, grad: np.ndarray) -> np.ndarray:
         grad_out = grad.copy()
         grad = self.mlp.backward(grad)
         grad = self.ln_2.backward(grad)
@@ -312,29 +306,30 @@ class Block:
 
 
 class CrossEntropy:
-    def __init__(self, axis):
+    def __init__(self, axis = -1):
         self.axis = axis
         self.x = None
         self.y = None
         self.ignore_index = None
+        self.idx = None
 
     def __log_softmax(self, x):
-        c = x.max(axis=-1, keepdims=True)
-        logsumexp = np.log(np.exp(x - c).sum(axis=-1, keepdims=True))
+        c = x.max(axis=self.axis, keepdims=True)
+        logsumexp = np.log(np.exp(x - c).sum(axis=self.axis, keepdims=True))
         return x - c - logsumexp
 
-    def forward(self, x, y, ignore_index=-1):
+    def forward(self, x: np.ndarray, y: np.ndarray, ignore_index=-1):
         self.x = x
         self.y = y
         self.ignore_index = ignore_index
-        mask = (y != ignore_index)
-        idx = (np.arange(y.shape[0])[mask], y[mask])
-        loss = - 1. / y[mask].shape[0] * np.sum(self.__log_softmax(x)[idx])
+        masked = np.where(y != -1, np.take_along_axis( self.__log_softmax(x), np.expand_dims(y, 1), axis=1).T, 0)
+        loss = - 1. / np.count_nonzero(y != -1) * np.sum(masked)
         return loss
 
-    def backward(self, grad=None):
+    def backward(self, grad=None) -> np.ndarray:
         exp_x = np.exp(self.x - np.expand_dims(np.max(self.x, axis=self.axis), axis=self.axis))
         probs = exp_x/np.sum(exp_x, axis=self.axis, keepdims=True)
+        probs[self.idx] -= 1.
         out = probs / np.count_nonzero(self.y != self.ignore_index)
         out[self.y == self.ignore_index] = 0.
         return out
@@ -364,51 +359,52 @@ class AdamW:
         self.lr = lr
         self.betas = betas
         self.weight_decay = weight_decay
-        self.t = 1
         self.eps = eps
 
         number_of_tensors = model.get_number_of_tensors()
         self.mt: list = [.0 for _ in range(number_of_tensors)]
         self.vt: list = [.0 for _ in range(number_of_tensors)]
+        self.t: list = [.0 for _ in range(number_of_tensors)]
+        self.frozen_layers = []
+
+    def freeze_layers(self, names):
+        self.frozen_layers = names
 
     def step(self):
         model_params = self.model.named_parameter_optim_groups(self.weight_decay)
-        self.t += 1
         idx = 0
+        beta_1,  beta_2 = self.betas
         for param in model_params[0]["params"]:
-            param[0] -= model_params[0]["weight_decay"] * param[0]
-
-            self.mt[idx] = self.betas[0] * self.mt[idx] + (1-self.betas[0]) * param[1]
-            self.vt[idx] = self.betas[1] * self.vt[idx] + (1-self.betas[1]) * np.square(param[1])
-            mt_hat = self.mt[idx] / (1 - np.power(self.betas[0], self.t))
-            vt_hat = self.vt[idx] / (1 - np.power(self.betas[1], self.t))
-            param[0] -= self.lr * mt_hat / (np.sqrt(vt_hat) + self.eps)
+            if param[2] not in self.frozen_layers:
+                self.t[idx] += 1
+                param[0] -= self.lr * model_params[0]["weight_decay"] * param[0]
+                self.mt[idx] = beta_1 * self.mt[idx] + (1. - beta_1) * param[1]
+                self.vt[idx] = beta_2 * self.vt[idx] + (1. - beta_2) * np.square(param[1])
+                mt_hat = self.mt[idx] / (1 - math.pow(beta_1, self.t[idx]))
+                vt_hat = self.vt[idx] / (1 - math.pow(beta_2, self.t[idx]))
+                param[0] -= self.lr * mt_hat / (np.sqrt(vt_hat) + self.eps)
             idx += 1
 
         for param in model_params[1]["params"]:
-            self.mt[idx] = self.betas[0] * self.mt[idx] + (1-self.betas[0]) * param[1]
-            self.vt[idx] = self.betas[1] * self.vt[idx] + (1-self.betas[1]) * np.square(param[1])
-            mt_hat = self.mt[idx] / (1 - np.power(self.betas[0], self.t))
-            vt_hat = self.vt[idx] / (1 - np.power(self.betas[1], self.t))
-            param[0] -= self.lr * mt_hat / (np.sqrt(vt_hat) + self.eps)
+            if param[2] not in self.frozen_layers:
+                self.t[idx] += 1
+                self.mt[idx] = beta_1 * self.mt[idx] + (1. - beta_1) * param[1]
+                self.vt[idx] = beta_2 * self.vt[idx] + (1. - beta_2) * np.square(param[1])
+                mt_hat = self.mt[idx] / (1 - math.pow(beta_1, self.t[idx]))
+                vt_hat = self.vt[idx] / (1 - math.pow(beta_2, self.t[idx]))
+                param[0] -= self.lr * mt_hat / (np.sqrt(vt_hat) + self.eps)
             idx += 1
 
-    def zero_grad(self, set_to_none=True):
+    def zero_grad(self):
         model_params = self.model.named_parameter_optim_groups(self.weight_decay)
 
-        if set_to_none:
-            for param in model_params[0]["params"]:
-                param[1] = None
+        for param in model_params[0]["params"]:
+            param[1].fill(0.) # = np.zeros_like(param[1])
 
-            for param in model_params[1]["params"]:
-                param[1] = None
-        else:
-            for param in model_params[0]["params"]:
-                param[1] = np.zeros_like(param[1])
+        for param in model_params[1]["params"]:
+            param[1].fill(0.) # = np.zeros_like(param[1])
 
-            for param in model_params[1]["params"]:
-                param[1] = np.zeros_like(param[1])
-
+from cupyx import profiler
 class GPT:
 
     def __init__(self, config: GPTConfig):
@@ -425,34 +421,31 @@ class GPT:
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         )
         self.cross_entropy = CrossEntropy(config.axis)
+        self.sm = Softmax(config.axis)
         self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False, dtype=config.dtype)
-        #TODO: Check for wte embedding initialization
+
         self.transformer["wte"].weight = self.lm_head.W.copy() # https://paperswithcode.com/method/weight-tying
-        self.sm = Softmax(-1)
 
         # init all weights
         self.apply_params(self._init_weights)
 
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        # for pn, p in self.named_parameters():
-        #     if pn.endswith('c_proj.weight'):
-        #         torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
         # report number of parameters
-        # print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
         self.loss = None
         self.idx = None
+        self.gradient_accumulation_steps = None
 
     def apply_params(self, fn):
         fn(self.transformer["wte"])
         fn(self.transformer["wpe"])
         for h_block in self.transformer["h"]:
             fn(h_block.attn.c_attn)
-            fn(h_block.attn.c_proj)
-            h_block.attn.c_proj.W = np.random.normal(0.0, 0.02/math.sqrt(2 * self.config.n_layer), size=h_block.attn.c_proj.W.shape).astype(dtype=self.config.dtype)
             fn(h_block.mlp.c_fc)
-            fn(h_block.mlp.c_proj)
+            # apply special scaled init to the residual projections, per GPT-2 paper
+            h_block.attn.c_proj.W = np.random.normal(0.0, 0.02/math.sqrt(2 * self.config.n_layer), size=h_block.attn.c_proj.W.shape).astype(dtype=self.config.dtype)
+            h_block.mlp.c_proj.W = np.random.normal(0.0, 0.02/math.sqrt(2 * self.config.n_layer), size=h_block.mlp.c_proj.W.shape).astype(dtype=self.config.dtype)
+        fn(self.lm_head)
 
     def _init_weights(self, module):
         if isinstance(module, Linear):
@@ -474,9 +467,17 @@ class GPT:
         num_decay_params = sum(p[0].size for p in optim_groups[0]["params"])
         num_nodecay_params = sum(p[0].size for p in optim_groups[1]["params"])
 
-        return num_decay_params + num_nodecay_params
+        total = num_decay_params + num_nodecay_params
 
-    def forward(self, idx, targets=None):
+        if non_embedding:
+            total -= self.transformer["wte"].weight.size
+
+        return total
+
+    def forward(self, idx, targets=None, gradient_accumulation_steps=1):
+
+
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.idx = idx
         b, t = idx.shape[0], idx.shape[1]
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -494,7 +495,7 @@ class GPT:
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head.forward(x)
-            loss = self.cross_entropy.forward(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), ignore_index=-1)
+            loss = self.cross_entropy.forward(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), ignore_index=-1) / gradient_accumulation_steps
         else:
             # TODO: Check
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -504,6 +505,7 @@ class GPT:
         return logits, loss
 
     def backward(self, grad=None):
+
         grad = self.cross_entropy.backward() # logits grad
         # TODO: Be carefully
         grad = grad.reshape(self.idx.shape[0], self.idx.shape[1], self.config.vocab_size)
@@ -514,7 +516,6 @@ class GPT:
         grad = self.transformer["drop"].backward(grad)
         self.transformer["wte"].backward(grad)
         self.transformer["wpe"].backward(grad)
-
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -586,7 +587,6 @@ class GPT:
     #     return model
 
     def named_parameter_optim_groups(self, weight_decay):
-
         decay_params = []
         nodecay_params = []
 
@@ -597,22 +597,22 @@ class GPT:
             nodecay_params.append([h_block.ln_1.bias, h_block.ln_1.bias_g, f"block_{i}.ln_1.b"])
 
             decay_params.append([h_block.attn.c_attn.W, h_block.attn.c_attn.Wg, f"block_{i}.attn.c_attn.w"])
-            decay_params.append([h_block.attn.c_attn.b, h_block.attn.c_attn.bg, f"block_{i}.attn.c_attn.b"])
+            nodecay_params.append([h_block.attn.c_attn.b, h_block.attn.c_attn.bg, f"block_{i}.attn.c_attn.b"])
             decay_params.append([h_block.attn.c_proj.W, h_block.attn.c_proj.Wg, f"block_{i}.attn.c_proj.w"])
-            decay_params.append([h_block.attn.c_proj.b, h_block.attn.c_proj.bg, f"block_{i}.attn.c_proj.b"])
+            nodecay_params.append([h_block.attn.c_proj.b, h_block.attn.c_proj.bg, f"block_{i}.attn.c_proj.b"])
 
             nodecay_params.append([h_block.ln_2.weight, h_block.ln_2.weight_g, f"block_{i}.ln_2.w"])
             nodecay_params.append([h_block.ln_2.bias, h_block.ln_2.bias_g, f"block_{i}.ln_2.b"])
 
             decay_params.append([h_block.mlp.c_fc.W, h_block.mlp.c_fc.Wg, f"block_{i}.mlp.c_fc.w"])
-            decay_params.append([h_block.mlp.c_fc.b, h_block.mlp.c_fc.bg, f"block_{i}.mlp.c_fc.b"])
+            nodecay_params.append([h_block.mlp.c_fc.b, h_block.mlp.c_fc.bg, f"block_{i}.mlp.c_fc.b"])
             decay_params.append([h_block.mlp.c_proj.W, h_block.mlp.c_proj.Wg, f"block_{i}.mlp.c_proj.w"])
-            decay_params.append([h_block.mlp.c_proj.b, h_block.mlp.c_proj.bg, f"block_{i}.mlp.c_proj.b"])
+            nodecay_params.append([h_block.mlp.c_proj.b, h_block.mlp.c_proj.bg, f"block_{i}.mlp.c_proj.b"])
 
         nodecay_params.append([self.transformer["ln_f"].weight, self.transformer["ln_f"].weight_g, f"ln_f.w"])
         nodecay_params.append([self.transformer["ln_f"].bias, self.transformer["ln_f"].bias_g, f"ln_f.b"])
 
-        nodecay_params.append([self.lm_head.W, self.lm_head.Wg, f"lm_head.w"])
+        decay_params.append([self.lm_head.W, self.lm_head.Wg, f"lm_head.w"])
         nodecay_params.append([self.lm_head.b, self.lm_head.bg, f"lm_head.b"])
 
         optim_groups = [
@@ -683,3 +683,4 @@ class GPT:
             # append sampled index to the running sequence and continue
             idx = np.concatenate((idx, np.expand_dims(idx_next, axis=0)), axis=1)
         return idx
+
