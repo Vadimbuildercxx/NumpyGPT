@@ -23,7 +23,7 @@ except:
     print("CUDA is NOT available, run train on cpu...")
     pass
 
-from model import GPTConfig, GPT
+from model_gpu import GPTConfig, GPT
 #from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -32,7 +32,7 @@ from model import GPTConfig, GPT
 out_dir = 'out'
 eval_interval = 500
 log_interval = 1
-eval_iters = 10 #200
+eval_iters = 0 #200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -42,7 +42,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'shakespeare'
-gradient_accumulation_steps = 5 * 4 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 # 5 * 4 # used to simulate larger batch sizes
 batch_size = 6 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 256 # 1024
 # model
@@ -54,7 +54,7 @@ bias = True # do we use bias inside LayerNorm and Linear layers?
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 3 # total number of training iterations
+max_iters = 5 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -70,7 +70,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 #dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-#exec(open('/configurator.py').read()) # overrides from command line or config file
+exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -278,9 +278,9 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        #if local_iter_num >= 5: # let the training loop settle a bit
-            #mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            #running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        if local_iter_num >= 5: # let the training loop settle a bit
+            mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
