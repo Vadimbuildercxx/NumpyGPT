@@ -27,9 +27,9 @@ except:
     print("CUDA is NOT available, run model on cpu...")
     pass
 
+
 class LayerNorm:
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-
     def __init__(self, ndim, bias, eps=1e-05,):
         super().__init__()
         self.weight = np.ones(ndim)
@@ -39,18 +39,15 @@ class LayerNorm:
 
         self.eps = eps
 
-        self.mean = None
-        self.var = None
         self.sqrt_var = None
         self.saved_normalized = None
         self.scaled_x = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        self.mean = x.mean(-1, keepdims=True) # (B, T, 1)
-        self.var = x.var(-1, ddof=0, keepdims=True) # (B, T, 1)
-        self.sqrt_var = np.sqrt(self.var + self.eps) # (B, T, 1)
-        self.scaled_x = (x - self.mean)
-        normalized = self.scaled_x / self.sqrt_var  #(B, T, C)
+        mean = x.mean(-1, keepdims=True) # (B, T, 1)
+        var = x.var(-1, ddof=0, keepdims=True) # (B, T, 1)
+        self.sqrt_var = np.sqrt(var + self.eps) # (B, T, 1)
+        normalized = (x - mean) / self.sqrt_var  #  (B, T, C)
 
         self.saved_normalized = normalized
 
@@ -279,7 +276,6 @@ class CausalSelfAttention:
         # manual implementation of attention
         att = np.matmul(self.q_t,  np.transpose(self.k_t, (0, 1, 3, 2))) * (1.0 / math.sqrt(self.k_t.shape[-1]))
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        #att = np.where(np.tril(np.ones_like(att))[:, :, :self.T, :self.T] != 0, att, float('-inf'))
         att = np.where(np.tril(att, self.T - att.shape[-1]) != 0, att, float('-inf'))
         att = self.softmax.forward(att)
         self.att = self.attn_dropout.forward(att)
@@ -307,7 +303,6 @@ class CausalSelfAttention:
 
         att_dropout_g = self.attn_dropout.backward(att_g)
         att_softmax_g = self.softmax.backward(att_dropout_g)
-        #att_softmax_g = np.where(np.tril(np.ones_like(att_softmax_g))[:, :, :self.T, :self.T] != 0, att_softmax_g, 0)
         att_softmax_g = np.where(np.tril(att_softmax_g, self.T - att_softmax_g.shape[-1]) != 0, att_softmax_g, 0)
 
         q_t_g = (1.0 / math.sqrt(self.k_t.shape[-1])) * (np.matmul(att_softmax_g, self.k_t))
@@ -443,10 +438,21 @@ class AdamW:
         model_params = self.model.named_parameter_optim_groups(self.weight_decay)
 
         for param in model_params[0]["params"]:
-            param[1].fill(0.) # = np.zeros_like(param[1])
+            param[1].fill(0.)
 
         for param in model_params[1]["params"]:
-            param[1].fill(0.) # = np.zeros_like(param[1])
+            param[1].fill(0.)
+
+    def load_state_dict(self, checkpoint):
+        self.mt = checkpoint["mt"]
+        self.vt = checkpoint["vt"]
+        self.t = checkpoint["t"]
+
+    def state_dict(self):
+        params = {"mt": self.mt, "vt": self.vt, "t": self.t}
+        return params
+
+
 
 from cupyx import profiler
 class GPT:
@@ -518,7 +524,23 @@ class GPT:
 
         return total
 
-    def forward(self, idx, targets=None, gradient_accumulation_steps=1):
+    def get_param_norms(self):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        optim_groups = self.named_parameter_optim_groups(0.0)
+
+        num_decay_params = [np.linalg.norm(p[0]) for p in optim_groups[0]["params"]]
+        num_nodecay_params = [np.linalg.norm(p[0]) for p in optim_groups[1]["params"]]
+
+        param_norms = num_decay_params + num_nodecay_params
+
+        return param_norms
+
+    def forward(self, idx, targets=None, gradient_accumulation_steps=1, calculate_norms = True):
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.idx = idx
         b, t = idx.shape[0], idx.shape[1]
@@ -544,7 +566,11 @@ class GPT:
             logits = self.lm_head.forward(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        norms = None
+        if calculate_norms:
+            norms = sum(self.get_param_norms())
+
+        return logits, loss, norms
 
     def backward(self, grad=None):
         grad = self.cross_entropy.backward() / self.gradient_accumulation_steps # logits grad
@@ -569,62 +595,60 @@ class GPT:
             block.attn.c_attn.b = block.attn.c_attn.b[:, :, :block_size, :block_size]
             block.attn.c_proj.b = block.attn.c_proj.b[:, :, :block_size, :block_size]
 
-    # @classmethod
-    # def from_pretrained(cls, model_type, override_args=None):
-    #     assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-    #     override_args = override_args or {} # default to empty dict
-    #     # only dropout can be overridden see more notes below
-    #     assert all(k == 'dropout' for k in override_args)
-    #     from transformers import GPT2LMHeadModel
-    #     print("loading weights from pretrained gpt: %s" % model_type)
-    #
-    #     # n_layer, n_head and n_embd are determined from model_type
-    #     config_args = {
-    #         'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-    #         'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-    #         'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-    #         'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-    #     }[model_type]
-    #     print("forcing vocab_size=50257, block_size=1024, bias=True")
-    #     config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-    #     config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-    #     config_args['bias'] = True # always True for GPT model checkpoints
-    #     # we can override the dropout rate, if desired
-    #     if 'dropout' in override_args:
-    #         print(f"overriding dropout rate to {override_args['dropout']}")
-    #         config_args['dropout'] = override_args['dropout']
-    #     # create a from-scratch initialized minGPT model
-    #     config = GPTConfig(**config_args)
-    #     model = GPT(config)
-    #     sd = model.state_dict()
-    #     sd_keys = sd.keys()
-    #     sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-    #
-    #     # init a huggingface/transformers model
-    #     model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-    #     sd_hf = model_hf.state_dict()
-    #
-    #     # copy while ensuring all of the parameters are aligned and match in names and shapes
-    #     sd_keys_hf = sd_hf.keys()
-    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-    #     transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-    #     # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-    #     # this means that we have to transpose these weights when we import them
-    #     assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-    #     for k in sd_keys_hf:
-    #         if any(k.endswith(w) for w in transposed):
-    #             # special treatment for the Conv1D weights we need to transpose
-    #             assert sd_hf[k].shape[::-1] == sd[k].shape
-    #             with torch.no_grad():
-    #                 sd[k].copy_(sd_hf[k].t())
-    #         else:
-    #             # vanilla copy over the other parameters
-    #             assert sd_hf[k].shape == sd[k].shape
-    #             with torch.no_grad():
-    #                 sd[k].copy_(sd_hf[k])
-    #
-    #     return model
+    @classmethod
+    def from_pretrained(cls, model_type, override_args=None):
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        override_args = override_args or {} # default to empty dict
+        # only dropout can be overridden see more notes below
+        assert all(k == 'dropout' for k in override_args)
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        # n_layer, n_head and n_embd are determined from model_type
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        config_args['bias'] = True # always True for GPT model checkpoints
+        # we can override the dropout rate, if desired
+        if 'dropout' in override_args:
+            print(f"overriding dropout rate to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
+        # create a from-scratch initialized minGPT model
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                sd[k].copy_(sd_hf[k])
+
+        return model
 
     def named_parameter_optim_groups(self, weight_decay):
         decay_params = []
@@ -662,10 +686,41 @@ class GPT:
 
         return optim_groups
 
+    def get_params_dict(self):
+        model_params = self.named_parameter_optim_groups(0.0)
+        model_params = model_params[0]["params"] + model_params[1]["params"]
+        params = {}
+        for p in model_params:
+            params[p[2]] = p[0]
+        return params
+
+    def load_from_dict(self, model_dict):
+        model_params = self.named_parameter_optim_groups(0.0)
+        model_params = model_params[0]["params"] + model_params[1]["params"]
+        for p in model_params:
+            p[0] = model_dict[p[2]]
+
     def get_number_of_tensors(self):
         optim_groups = self.named_parameter_optim_groups(None)
 
         return len(optim_groups[0]['params']) + len(optim_groups[1]['params'])
+
+    def clip_gradient(self, max_norm, clip_norm):
+        optim_groups = self.named_parameter_optim_groups(0.0)
+        params = optim_groups[0]['params'] + optim_groups[1]['params']
+        norms = []
+        for p in params:
+            norms.append(np.linalg.norm(p[1], ord=clip_norm))
+
+        total_norm = np.linalg.norm(
+            np.stack(norms), ord=clip_norm
+        )
+
+        clip_coef = max_norm / (total_norm + 1e-6)
+        clip_coef_clamped = np.clip(clip_coef, a_min=1.0, a_max=1.0)
+
+        for p in params:
+            p[1] *= clip_coef_clamped
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type=None):
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.

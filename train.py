@@ -10,6 +10,7 @@ import time
 import math
 import pickle
 
+import utils
 import numpy
 import numpy as np
 try:
@@ -42,7 +43,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'shakespeare'
-gradient_accumulation_steps = 1 # 5 * 4 # used to simulate larger batch sizes
+gradient_accumulation_steps = 5 * 4 # used to simulate larger batch sizes
 batch_size = 6 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 256 # 1024
 # model
@@ -54,11 +55,11 @@ bias = True # do we use bias inside LayerNorm and Linear layers?
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 5 # total number of training iterations
+max_iters = 300 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 0.0 # clip gradients at this value, or disable if == 0.0. Default - 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -133,29 +134,24 @@ if init_from == 'scratch':
     model = GPT(gptconf)
 
 elif init_from == 'resume':
-    raise Exception("Does not worked yet")
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
+    checkpoint = utils.load_params_dict(ckpt_path)
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
+        model_args[k] = checkpoint['config'][k]
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    model.load_from_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+
 elif init_from.startswith('gpt2'):
     raise Exception("Does not worked yet")
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
@@ -173,13 +169,9 @@ elif init_from.startswith('gpt2'):
 print(gptconf)
 # optimizer
 optimizer, optim_groups = model.configure_optimizers(weight_decay, learning_rate, [beta1, beta2])
-# if init_from == 'resume':
-#     optimizer.load_state_dict(checkpoint['optimizer'])
+if init_from == 'resume':
+    optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
-
-# wrap model into DDP container
-# if ddp:
-#     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 
@@ -215,9 +207,10 @@ if wandb_log and master_process:
 
 # training loop
 total_time = time.time()
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = get_batch('train')  # fetch the very first batch
 t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
+local_iter_num = 0  # number of iterations in the lifetime of this process
+raw_model = model
 running_mfu = -1.0
 while True:
 
@@ -235,13 +228,13 @@ while True:
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "mfu": running_mfu*100,  # convert to percentage
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
-                    'model': raw_model.state_dict(),
+                    'model': raw_model.get_params_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
@@ -249,22 +242,22 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                utils.save_params_dict(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
     if iter_num == 0 and eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        logits, loss = model.forward(X, Y, gradient_accumulation_steps)
+        logits, loss, norm = model.forward(X, Y, gradient_accumulation_steps)
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         model.backward()
     # clip the gradient
-    # if grad_clip != 0.0:
-    #     scaler.unscale_(optimizer)
-    #     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    if grad_clip != 0.0:
+        model.clip_gradient(grad_clip, clip_norm=2)
     # step the optimizer and scaler if training in fp16
     optimizer.step()
     # flush the gradients as soon as we can, no need for this memory anymore
@@ -278,10 +271,10 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
+        if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, grad norm: {norm:.4f}")
     iter_num += 1
     local_iter_num += 1
     # termination conditions
