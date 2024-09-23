@@ -31,9 +31,9 @@ from model_gpu import GPTConfig, GPT
 # I/O
 
 out_dir = 'out'
-eval_interval = 500
+eval_interval = 50
 log_interval = 1
-eval_iters = 0 #200
+eval_iters = 10 #200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -136,21 +136,22 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'ckpt.npy')
     checkpoint = utils.load_params_dict(ckpt_path)
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint['config'][k]
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias']:
+        model_args[k] = checkpoint.any().get('config').get(k)
+    model_args['vocab_size'] = checkpoint.any().get('config').get('meta_vocab_size')
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-    state_dict = checkpoint['model']
+    state_dict = checkpoint.any().get('model')
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     model.load_from_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    iter_num = checkpoint.any().get('iter_num')
+    best_val_loss = checkpoint.any().get('best_val_loss')
 
 elif init_from.startswith('gpt2'):
     raise Exception("Does not worked yet")
@@ -170,7 +171,7 @@ print(gptconf)
 # optimizer
 optimizer, optim_groups = model.configure_optimizers(weight_decay, learning_rate, [beta1, beta2])
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    optimizer.load_state_dict(checkpoint.any().get('optimizer'))
 checkpoint = None # free up memory
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -181,7 +182,7 @@ def estimate_loss():
         losses = np.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model.forward(X, Y)
+            logits, loss, _ = model.forward(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     return out
@@ -234,7 +235,7 @@ while True:
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
-                    'model': raw_model.get_params_dict(),
+                    'model': model.get_params_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
@@ -242,7 +243,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                utils.save_params_dict(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                utils.save_params_dict(checkpoint, os.path.join(out_dir, 'ckpt'))
 
     if iter_num == 0 and eval_only:
         break

@@ -444,17 +444,16 @@ class AdamW:
             param[1].fill(0.)
 
     def load_state_dict(self, checkpoint):
-        self.mt = checkpoint["mt"]
-        self.vt = checkpoint["vt"]
-        self.t = checkpoint["t"]
+        for i in range(len(self.t)):
+            self.mt[i] = np.copy(checkpoint["mt"][i])
+            self.vt[i] = np.copy(checkpoint["vt"][i])
+            self.t[i] = checkpoint["t"][i]
 
     def state_dict(self):
         params = {"mt": self.mt, "vt": self.vt, "t": self.t}
         return params
 
 
-
-from cupyx import profiler
 class GPT:
 
     def __init__(self, config: GPTConfig):
@@ -691,14 +690,14 @@ class GPT:
         model_params = model_params[0]["params"] + model_params[1]["params"]
         params = {}
         for p in model_params:
-            params[p[2]] = p[0]
+            params[p[2]] = np.copy(p[0])
         return params
 
     def load_from_dict(self, model_dict):
         model_params = self.named_parameter_optim_groups(0.0)
         model_params = model_params[0]["params"] + model_params[1]["params"]
         for p in model_params:
-            p[0] = model_dict[p[2]]
+            p[0][True] = np.copy(model_dict[p[2]])  # True placed for change existing array, not replacing array in list.
 
     def get_number_of_tensors(self):
         optim_groups = self.named_parameter_optim_groups(None)
