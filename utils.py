@@ -2,6 +2,12 @@ import numpy as np
 import cupy as cp
 
 
+def vectorized_multinomial(probs):
+    s = probs.cumsum(axis=1)
+    r = np.random.rand(probs.shape[0])
+    k = ((s < r).sum(axis=1)).astype(np.int64)
+    return k
+
 def save_params_dict_cupy(params, path):
     """
     Save a dictionary of parameters to a file in cupy format.
@@ -21,7 +27,7 @@ def load_params_dict_cupy(path):
     :param path: Path to save the dictionary to.
     :return:
     """
-    params = load_params_dict(path)
+    params = load_params_dict(path).item()
     for k, v in params['model'].items():
         params['model'][k] = cp.asarray(v)
     return params
