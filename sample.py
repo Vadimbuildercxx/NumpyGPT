@@ -14,24 +14,24 @@ import numpy as np
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
-start = "Dear friend. I want" #"\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+start = "\n" #"\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 1 # number of samples to draw
-max_new_tokens = 100 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
+max_new_tokens = 200 # number of tokens generated in each sample
+temperature = 1.0 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed_offset = 0
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
-np.random.seed(42 + seed_offset)
+#np.random.seed(42 + seed_offset)
 
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.npy')
     checkpoint = utils.load_params_dict_cupy(ckpt_path)
-    print(checkpoint['config'])
+    print(checkpoint['best_val_loss'])
     model_args = dict()
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias']:
         model_args[k] = checkpoint['config'][k]
@@ -82,3 +82,4 @@ for k in range(num_samples):
     y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
     print(decode(y[0].tolist()))
     print('---------------')
+

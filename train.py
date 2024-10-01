@@ -93,18 +93,21 @@ np.random.seed(42 + seed_offset)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+
+
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
-        data = np.asarray(numpy.memmap(os.path.join(data_dir, 'train.bin'), dtype=numpy.uint16, mode='r')) # Cast to cupy or numpy depends on gpu
+        data = numpy.memmap(os.path.join(data_dir, 'train.bin'), dtype=numpy.uint16, mode='r')
     else:
-        data = np.asarray(numpy.memmap(os.path.join(data_dir, 'val.bin'), dtype=numpy.uint16, mode='r')) # Cast to cupy or numpy depends on gpu
+        data = numpy.memmap(os.path.join(data_dir, 'val.bin'), dtype=numpy.uint16, mode='r')
 
-    ix = np.random.randint(len(data) - block_size, size=(batch_size,))
-    x = np.stack([(data[i:i+block_size]).astype(np.int64) for i in ix])
-    y = np.stack([(data[i+1:i+1+block_size]).astype(np.int64) for i in ix])
+    ix = numpy.random.randint(len(data) - block_size, size=(batch_size,))
+    x = np.asarray(numpy.stack([(data[i:i+block_size]).astype(numpy.int64) for i in ix]))
+    y = np.asarray(numpy.stack([(data[i+1:i+1+block_size]).astype(numpy.int64) for i in ix]))
     return x, y
+
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -175,6 +178,7 @@ checkpoint = None # free up memory
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 
+
 def estimate_loss():
     out = {}
     for split in ['train', 'val']:
@@ -185,6 +189,7 @@ def estimate_loss():
             losses[k] = loss.item()
         out[split] = losses.mean()
     return out
+
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -199,6 +204,7 @@ def get_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
+
 
 # logging
 if wandb_log and master_process:
